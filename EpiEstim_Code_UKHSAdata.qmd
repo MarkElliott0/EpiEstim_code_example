@@ -1,0 +1,241 @@
+---
+title: "EpiEstim Code UKHSA"
+author: "Mark Elliott"
+format: html
+editor: visual
+---
+
+## EpiEstim package and example for UKHSA data - COVID in England
+
+Adapted from the EpiEstim demonstration code <https://cran.r-project.org/web/packages/EpiEstim/vignettes/demo.html>
+
+load required packages
+
+```{r}
+library(EpiEstim)
+library(tidyverse)
+library(readr)
+```
+
+load the data and create the base dataset - UKHSA data.
+
+```{r}
+# Create si_data based on the 2009 flu data (within EpiEstim) - to use within the model
+si_data <- Flu2009$si_data
+
+#Bring in own data from UKHSA dashboard - https://ukhsa-dashboard.data.gov.uk/
+ukhsa_chart_download <- read_csv("ukhsa-chart-download.csv")
+
+# Create UKHSA dataset - select required columns and rename metric_value to I 
+UKHSA_Data <- ukhsa_chart_download %>% 
+  select(date, metric_value) %>% 
+  rename("I" = "metric_value")
+
+## interval-censored serial interval data:
+## each line represents a transmission event, 
+## EL/ER show the lower/upper bound of the symptoms onset date in the infector
+## SL/SR show the same for the secondary case
+## type has entries 0 corresponding to doubly interval-censored data
+## (see Reich et al. Statist. Med. 2009).
+head(UKHSA_Data)
+```
+
+Estimating R on a sliding weekly window
+
+```{r}
+# Estimating R on sliding weekly windows, with parametric serial interval
+res_parametric_si <- estimate_R(UKHSA_Data, 
+                                method = "parametric_si", 
+                                config = make_config(list(
+                                  mean_si = 2.6, 
+                                  std_si = 1.5
+                                )))
+
+# Show the first observations in the dataset 
+head(res_parametric_si$R)
+
+# Plot the output of res_parametric_si 
+plot(res_parametric_si, legend = FALSE)
+```
+
+```{r}
+## Estimating R with non-parametric serial interval distribution 
+res_non_parametric_si <- estimate_R(UKHSA_Data, 
+                                    method="non_parametric_si", # assign method as non-parametric
+                                    config = make_config(list(
+                                      si_distr = Flu2009$si_distr)) 
+# Use the SI distribution from the flu data - replace once COVID SI available
+)
+
+# si_distr gives the probability mass function of the serial interval for 
+# time intervals 0, 1, 2, etc.
+plot(res_non_parametric_si, "R")
+
+# Compute the discrete distributon of the serial interval
+discr_si(0:20, mu = 2.6, sigma = 1.5)
+```
+
+Estimating R accounting for uncertainty on the serial interval distribution
+
+```{r}
+## we choose to draw:
+## - the mean of the SI in a Normal(2.6, 1), truncated at 1 and 4.2
+## - the sd of the SI in a Normal(1.5, 0.5), truncated at 0.5 and 2.5
+config <- make_config(list(mean_si = 2.6, std_mean_si = 1,
+                           min_mean_si = 1, max_mean_si = 4.2,
+                           std_si = 1.5, std_std_si = 0.5,
+                           min_std_si = 0.5, max_std_si = 2.5))
+res_uncertain_si <- estimate_R(UKHSA_Data,
+                               method = "uncertain_si",
+                               config = config)
+
+# Plot the output res_uncertainty_si
+plot(res_uncertain_si, legend = FALSE)
+
+```
+
+Estimating R and the serial interval using data on pairs infector/infected
+
+```{r}
+## interval-ceonsored serial interval data: each line represents a transmission event, 
+## EL/ER show the lower/upper bound of the symptoms onset date in the infector
+## SL/SR show the same for the secondary case
+## type has entries 0 corresponding to doubly interval-censored data
+## (see Reich et al. Statist. Med. 2009).
+head(si_data)
+
+# Estimate the SI within estimate_R and produce estimates of the reproduction number
+# Fixing the random seed 
+MCMC_seed <- 1
+overall_seed <- 2
+mcmc_control <- make_mcmc_control(seed = MCMC_seed, 
+                                  burnin = 1000)
+
+dist <- "G" # fitting a Gamma distribution for the SI
+config <- make_config(list(si_parametric_distr = dist,
+                           mcmc_control = mcmc_control,
+                           seed = overall_seed, 
+                           n1 = 50, 
+                           n2 = 50))
+
+res_si_from_data <- estimate_R(UKHSA_Data, 
+                               method = "si_from_data", 
+                               si_data = si_data, 
+                               config = config)
+
+plot(res_si_from_data, legend = FALSE)
+
+```
+
+```{r}
+## using the same random seeds as before to be able to compare results
+
+## first estimate the SI distribution using function dic.fit.mcmc fron 
+## coarseDataTools package:
+n_mcmc_samples <- config$n1*mcmc_control$thin
+SI_fit <- coarseDataTools::dic.fit.mcmc(dat = si_data,
+                  dist = dist,
+                  init.pars = init_mcmc_params(si_data, dist),
+                  burnin = mcmc_control$burnin,
+                  n.samples = n_mcmc_samples,
+                  seed = mcmc_control$seed)
+
+## thinning the output of the MCMC and converting using coarse2estim function
+si_sample <- coarse2estim(SI_fit, thin = mcmc_control$thin)$si_sample
+res_si_from_sample <- estimate_R(UKHSA_Data,
+                                method = "si_from_sample",
+                                si_sample = si_sample,
+                                config = make_config(list(n2 = 50, 
+                                seed = overall_seed)))
+
+
+## check that res_si_from_sample is the same as res_si_from_data
+## since they were generated using the same MCMC algorithm to generate the SI
+## sample (either internally to EpiEstim or externally)
+all(res_si_from_sample$R$`Mean(R)` == res_si_from_data$R$`Mean(R)`)
+
+T <- nrow(UKHSA_Data)
+t_start <- seq(2, T-6) # starting at 2 as conditional on the past observations
+t_end <- t_start + 6 # adding 6 to get 7-day windows as bounds included in window
+res_weekly <- estimate_R(UKHSA_Data, 
+                         method="parametric_si",
+                         config = make_config(list(
+                           t_start = t_start,
+                           t_end = t_end,
+                           mean_si = 2.6, 
+                           std_si = 1.5))
+)
+plot(res_weekly, "R") 
+```
+
+For biweekly estimates
+
+```{r}
+t_start <- seq(2, T-13) # starting at 2 as conditional on the past observations
+t_end <- t_start + 13 
+res_biweekly <- estimate_R(UKHSA_Data$I, 
+                           method="parametric_si",
+                           config = make_config(list(
+                             t_start = t_start,
+                             t_end = t_end,
+                             mean_si = 2.6, 
+                             std_si = 1.5))
+)
+plot(res_biweekly, "R")
+```
+
+It is interesting to estimate the reproduction number before, during, and after the school closure to assess whether this had an impact on transmissibility.
+
+```{r}
+t_start <- c(2, 100, 210) # starting at 2 as conditional on the past observations
+t_end <- c(50, 180, 280)
+res_before_during_after_closure <- estimate_R(UKHSA_Data, 
+                                              method="parametric_si",
+                                              config = make_config(list(
+                                                t_start = t_start,
+                                                t_end = t_end,
+                                                mean_si = 2.6, 
+                                                std_si = 1.5))
+)
+plot(res_before_during_after_closure, "R") +
+  geom_hline(aes(yintercept = 1), color = "red", lty = 2)
+```
+
+```{r}
+config <- make_config(list(mean_si = 2.6, std_si = 1.5))
+res_incid_table <- estimate_R(UKHSA_Data, 
+                              method="parametric_si",
+                              config = config)
+
+plot(res_incid_table, "R")
+
+res_incid_vector <- estimate_R(UKHSA_Data, 
+                               method="parametric_si",
+                               config = config)
+```
+
+Specifying imported cases
+
+```{r}
+# generating fake information on our cases - for those imported and local cases:
+location <- sample(c("local","imported"), length(dates_onset), replace=TRUE)
+location[1] <- "imported" # forcing the first case to be imported
+
+## get incidence per group (location)
+incid <- incidence(dates_onset, groups = location)
+
+plot(incid)
+```
+
+Estimate R with assumptions on serial interval
+
+```{r}
+# Create res with imports R estimate 
+res_with_imports <- estimate_R(incid, method = "parametric_si", 
+                               config = make_config(list(
+                                 mean_si = 2.6, std_si = 1.5
+                               )))
+
+# Plot the output and include imported cases 
+plot(res_with_imports, add_imported_cases = TRUE)
+```
